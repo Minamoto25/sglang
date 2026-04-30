@@ -51,7 +51,7 @@ def l2norm_fwd_kernel1(
 #     ],
 #     key=["D", "NB"],
 # )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NB"])
 def l2norm_fwd_kernel(
     x,
     y,
