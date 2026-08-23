@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+_rmsnorm_patch_applied = False
 
 
 # func refers to RMSNorm.__init__
@@ -44,7 +45,9 @@ def npu_wrapper_rmsnorm_init(func):
         func(self, hidden_size, **extra_args)
         self.ignore_anti = True
         # The Ascend w8a8_int8 quantization requires adding a bias in rmsnorm
-        self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
+        # The quantized checkpoint contains every RMSNorm bias, so avoid
+        # launching a zero-fill kernel for each layer during model creation.
+        self.bias = torch.nn.Parameter(torch.empty(hidden_size), requires_grad=False)
 
     return init
 
@@ -86,6 +89,8 @@ class ModelSlimConfig(QuantizationConfig):
     """
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
+        global _rmsnorm_patch_applied
+
         super().__init__()
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
@@ -95,18 +100,20 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
 
-        for name in self.quant_description.keys():
-            if "norm.bias" in name:
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "__init__",
-                    [npu_wrapper_rmsnorm_init],
-                )
-                apply_module_patch(
-                    "sglang.srt.layers.layernorm.RMSNorm",
-                    "forward_npu",
-                    [npu_wrapper_rmsnorm_forward],
-                )
+        if not _rmsnorm_patch_applied and any(
+            "norm.bias" in name for name in self.quant_description
+        ):
+            apply_module_patch(
+                "sglang.srt.layers.layernorm.RMSNorm",
+                "__init__",
+                [npu_wrapper_rmsnorm_init],
+            )
+            apply_module_patch(
+                "sglang.srt.layers.layernorm.RMSNorm",
+                "forward_npu",
+                [npu_wrapper_rmsnorm_forward],
+            )
+            _rmsnorm_patch_applied = True
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)

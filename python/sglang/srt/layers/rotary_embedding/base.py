@@ -262,6 +262,13 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        # RopeWithSinCosCache requires the per-head byte size to be 64-byte
+        # aligned. Fall back for uncommon head sizes such as Hunyuan's 80.
+        if self.head_size * query.element_size() % 64 != 0:
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
         if (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float

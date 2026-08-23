@@ -123,6 +123,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = -1,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -143,11 +144,12 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         # If it is moe, moe_intermediate_size is preferred
         intermediate_size = config.intermediate_size
-        if config.moe_intermediate_size is not None:
+        moe_intermediate_size = getattr(config, "moe_intermediate_size", None)
+        if moe_intermediate_size is not None:
             intermediate_size = (
-                config.moe_intermediate_size
-                if isinstance(config.moe_intermediate_size, int)
-                else config.moe_intermediate_size[layer_id]
+                moe_intermediate_size
+                if isinstance(moe_intermediate_size, int)
+                else moe_intermediate_size[layer_id]
             )
 
         self.topk = TopK(
@@ -163,6 +165,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             reduce_results=False,
             layer_id=layer_id,
             quant_config=quant_config,
+            prefix=f"{prefix}.experts",
         )
 
         self.gate = ReplicatedLinear(
@@ -183,6 +186,7 @@ class HunYuanSparseMoeBlock(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=f"{prefix}.shared_mlp",
             )
         else:
             self.shared_mlp = None
@@ -214,9 +218,11 @@ def get_head_dim(config):
     if hasattr(config, "attention_head_dim"):
         return int(config.attention_head_dim)
 
-    # since some hunyuan model don't follow the self.hidden_size // self.total_num_heads rule
-    # wrong setting may cause runtime error, just throw error if this field is missing.
-    raise ValueError("Missing head dim config, try set head_dim in config.json")
+    # Prefer an explicit head dimension, but the original Hunyuan-Large config
+    # omits it and uses the standard hidden_size / num_attention_heads layout.
+    if config.hidden_size % config.num_attention_heads != 0:
+        raise ValueError("hidden_size must be divisible by num_attention_heads")
+    return config.hidden_size // config.num_attention_heads
 
 
 def check_head_dim(config):
@@ -441,6 +447,7 @@ class HunYuanDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 layer_id=layer_id,
+                prefix=f"{prefix}.mlp",
             )
         else:
             self.mlp = HunYuanMLP(
@@ -508,7 +515,7 @@ class HunYuanModel(nn.Module):
                     config=config,
                     layer_id=layer_id,
                     quant_config=quant_config,
-                    # prefix=prefix
+                    prefix=f"{prefix}.layers.{layer_id}",
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -533,6 +540,7 @@ class HunYuanModel(nn.Module):
         residual = None
 
         prev_kv_states = None
+        cla_factor = _get_cla_factor(self.config)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual, kv_states = layer(
@@ -543,10 +551,8 @@ class HunYuanModel(nn.Module):
                 prev_kv_states,
             )
 
-            if False:  # (i - self.start_layer) % cla_factor == 0:
+            if i % cla_factor == 0:
                 prev_kv_states = kv_states
-            else:
-                prev_kv_states = None
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -594,6 +600,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
+            prefix="lm_head",
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -813,4 +820,14 @@ class HunYuanDenseV1ForCausalLM(HunYuanMoEV1ForCausalLM):
     pass
 
 
-EntryClass = [HunYuanMoEV1ForCausalLM, HunYuanDenseV1ForCausalLM]
+class HunYuanForCausalLM(HunYuanMoEV1ForCausalLM):
+    """Compatibility entry point for the original Hunyuan-Large checkpoints."""
+
+    pass
+
+
+EntryClass = [
+    HunYuanMoEV1ForCausalLM,
+    HunYuanDenseV1ForCausalLM,
+    HunYuanForCausalLM,
+]
